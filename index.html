@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Schwarzschild — real-time black hole</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; cursor: grab; }
+  canvas.dragging { cursor: grabbing; }
+  .ui {
+    position: fixed; pointer-events: none;
+    font: 12px/1.5 ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    color: rgba(255,255,255,.62); letter-spacing: .02em;
+  }
+  #title { top: 22px; left: 24px; }
+  #title h1 {
+    margin: 0 0 4px; font-size: 13px; font-weight: 500;
+    color: rgba(255,255,255,.9); letter-spacing: .14em; text-transform: uppercase;
+  }
+  #title p { margin: 0; max-width: 34ch; color: rgba(255,255,255,.42); }
+  #hint { bottom: 20px; left: 24px; color: rgba(255,255,255,.3); }
+  #stats { bottom: 20px; right: 24px; text-align: right; color: rgba(255,255,255,.3); }
+  #fallback {
+    position: fixed; inset: 0; display: none; place-content: center; padding: 2rem;
+    font: 14px/1.6 ui-monospace, monospace; color: #ddd; text-align: center;
+  }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div class="ui" id="title">
+  <h1>Schwarzschild</h1>
+  <p>Null geodesics integrated per pixel. Accretion disk, gravitational lensing, Doppler beaming.</p>
+</div>
+<div class="ui" id="hint">drag to orbit &nbsp;·&nbsp; scroll to zoom</div>
+<div class="ui" id="stats">—</div>
+<div id="fallback">This renderer needs WebGL.<br />Try a recent desktop browser.</div>
+
+<script id="vs" type="x-shader/x-vertex">
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+</script>
+
+<script id="fs" type="x-shader/x-fragment">
+precision highp float;
+
+uniform vec2  uRes;
+uniform float uTime;
+uniform float uYaw;
+uniform float uPitch;
+uniform float uDist;
+uniform float uSteps;
+
+// Units: Schwarzschild radius rs = 2M = 1, so M = 0.5.
+const float M       = 0.5;
+const float RS      = 1.0;
+const float DISK_IN = 3.0;    // ISCO = 6M
+const float R_OUT   = 12.0;
+const float DISK_H  = 0.085;  // half-thickness of the emitting volume
+const float R_FINE  = 20.0;   // below this radius the steps get small
+const float ESCAPE  = 45.0;
+
+// ---------------------------------------------------------------- utilities
+
+float hash11(float p) {
+  p = fract(p * 0.1031);
+  p *= p + 33.33;
+  p *= p + p;
+  return fract(p);
+}
+
+float hash13(vec3 p) {
+  p = fract(p * 0.1031);
+  p += dot(p, p.yzx + 33.33);
+  return fract((p.x + p.y) * p.z);
+}
+
+vec3 hash33(vec3 p) {
+  p = fract(p * vec3(0.1031, 0.1030, 0.0973));
+  p += dot(p, p.yxz + 33.33);
+  return fract((p.xxy + p.yxx) * p.zyx);
+}
+
+float vnoise(vec3 p) {
+  vec3 i = floor(p);
+  vec3 f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(
+    mix(mix(hash13(i),                    hash13(i + vec3(1.0, 0.0, 0.0)), f.x),
+        mix(hash13(i + vec3(0.0, 1.0, 0.0)), hash13(i + vec3(1.0, 1.0, 0.0)), f.x), f.y),
+    mix(mix(hash13(i + vec3(0.0, 0.0, 1.0)), hash13(i + vec3(1.0, 0.0, 1.0)), f.x),
+        mix(hash13(i + vec3(0.0, 1.0, 1.0)), hash13(i + vec3(1.0, 1.0, 1.0)), f.x), f.y),
+    f.z);
+}
+
+float fbm(vec3 p) {
+  float a = 0.5, s = 0.0;
+  for (int i = 0; i < 4; i++) {
+    s += a * vnoise(p);
+    p *= 2.03;
+    a *= 0.5;
+  }
+  return s;
+}
+
+// Hot -> cool ramp, roughly blackbody-ish.
+vec3 heatColor(float t) {
+  t = clamp(t, 0.0, 1.0);
+  vec3 cool = vec3(0.42, 0.055, 0.006);
+  vec3 mid  = vec3(1.00, 0.30, 0.02);
+  vec3 hot  = vec3(1.00, 0.96, 0.86);
+  return t < 0.5
+    ? mix(cool, mid, smoothstep(0.0, 0.55, t))
+    : mix(mid, hot, smoothstep(0.5, 1.0, t));
+}
+
+// ------------------------------------------------------------------- skydome
+
+vec3 starField(vec3 dir) {
+  vec3 col = vec3(0.0);
+
+  for (int layer = 0; layer < 2; layer++) {
+    float scale = 240.0 + float(layer) * 260.0;
+    vec3 p = dir * scale;
+    vec3 cell = floor(p);
+    vec3 rnd = hash33(cell);
+    if (rnd.x > 0.988) {
+      vec3 centre = cell + 0.5 + (rnd - 0.5) * 0.6;
+      float d = length(p - centre);
+      float bright = pow(hash11(rnd.y * 91.7 + float(layer) * 3.1), 3.0);
+      float radius = 0.09 + 0.22 * bright;
+      float core = exp(-d * d / (radius * radius));
+      vec3 tint = mix(vec3(0.68, 0.78, 1.00), vec3(1.00, 0.86, 0.72), rnd.z);
+      col += core * (0.35 + bright * 2.6) * tint;
+    }
+  }
+
+  // A faint galactic band, so empty sky still reads as depth.
+  float band = exp(-pow(abs(dir.y) * 3.4, 2.0));
+  float dust = fbm(dir * 3.0 + 11.0);
+  col += band * dust * vec3(0.020, 0.026, 0.042);
+
+  return col;
+}
+
+// --------------------------------------------------------------- the geodesic
+
+// RK4 step for u'' = -u + 3M u^2, where u = 1/r and phi is the orbital angle.
+void rk4(inout float u, inout float du, float dphi) {
+  float k1u = du;
+  float k1d = -u + 3.0 * M * u * u;
+
+  float u2 = u + 0.5 * dphi * k1u, d2 = du + 0.5 * dphi * k1d;
+  float k2u = d2,  k2d = -u2 + 3.0 * M * u2 * u2;
+
+  float u3 = u + 0.5 * dphi * k2u, d3 = du + 0.5 * dphi * k2d;
+  float k3u = d3,  k3d = -u3 + 3.0 * M * u3 * u3;
+
+  float u4 = u + dphi * k3u, d4 = du + dphi * k3d;
+  float k4u = d4,  k4d = -u4 + 3.0 * M * u4 * u4;
+
+  u  += dphi / 6.0 * (k1u + 2.0 * k2u + 2.0 * k3u + k4u);
+  du += dphi / 6.0 * (k1d + 2.0 * k2d + 2.0 * k3d + k4d);
+}
+
+void main() {
+  vec2 frag = gl_FragCoord.xy;
+  vec2 uv = (frag * 2.0 - uRes) / uRes.y;
+
+  // ---- camera ------------------------------------------------------------
+  float cp = cos(uPitch), sp = sin(uPitch);
+  vec3 camPos = uDist * vec3(cp * sin(uYaw), sp, cp * cos(uYaw));
+  vec3 forward = normalize(-camPos);
+  vec3 right = normalize(cross(vec3(0.0, 1.0, 0.0), forward));
+  vec3 up = cross(forward, right);
+
+  const float FOV = 1.6;
+  vec3 rd = normalize(uv.x * right + uv.y * up + FOV * forward);
+
+  // ---- orbital plane of this photon --------------------------------------
+  vec3 e1 = normalize(camPos);
+  float r0 = length(camPos);
+
+  float vr = dot(rd, e1);                       // radial part of the ray
+  vec3 perp = rd - vr * e1;                     // tangential part
+  float vt = length(perp);
+  vec3 e2 = vt > 1e-6
+    ? perp / vt
+    : normalize(cross(e1, vec3(0.0, 0.0, 1.0)));
+
+  float u  = 1.0 / r0;
+  // du/dphi = -(1/r^2) dr/dphi, with dr/dphi = vr * r / vt
+  float du = vr >= 0.0 ? 0.0 : -vr / (r0 * max(vt, 1e-5));
+
+  vec3  acc = vec3(0.0);
+  float trans = 1.0;
+  float phi = 0.0;
+  vec3 pos = camPos;
+  vec3 prevPos = camPos;
+
+  int steps = int(uSteps);
+
+  // ---- march -------------------------------------------------------------
+  for (int i = 0; i < 600; i++) {
+    if (i >= steps || trans < 0.004) break;
+
+    float rNow = 1.0 / max(u, 1e-6);
+
+    // Fine inside the region that matters, coarse far out where curvature is
+    // negligible. The step is an angle; arc length is roughly r * step.
+    float localStep = rNow < R_FINE
+      ? min(clamp(0.10 / rNow, 0.0035, 0.030), 0.16 / rNow)
+      : 0.050;
+
+    prevPos = pos;
+    float rBefore = rNow;
+
+    rk4(u, du, localStep);
+    phi += localStep;
+
+    if (u <= 0.0001) { trans = 0.0; break; }
+
+    float r = 1.0 / u;
+    pos = r * (cos(phi) * e1 + sin(phi) * e2);
+
+    if (r < RS * 1.02) { trans = 0.0; break; }          // through the horizon
+    if (r > ESCAPE && r > rBefore) break;               // escaped
+
+    // ---- accretion disk: analytic crossing of the y = 0 plane ------------
+    // A thin emissive sheet rather than a volume: crisp edges, and every
+    // higher-order image of the disk shows up as its own crossing.
+    if (prevPos.y * pos.y < 0.0) {
+      float t = prevPos.y / (prevPos.y - pos.y);
+      vec3 hit = mix(prevPos, pos, t);
+      float rh = length(hit.xz);
+
+      if (rh > DISK_IN && rh < R_OUT) {
+        float ang = atan(hit.z, hit.x);
+        float spin = ang - uTime * (1.4 / pow(rh, 1.5));
+        vec2 disc = vec2(cos(spin), sin(spin)) * rh;
+        float tex = 0.34 + 0.66 * fbm(vec3(disc * 1.6, uTime * 0.07) * 2.2);
+
+        // Radial temperature law T ~ r^-3/4, hottest at the inner edge.
+        float tNorm = pow(DISK_IN / rh, 0.75);
+        float temp = smoothstep(0.05, 1.0, tNorm);
+
+        // Keplerian beaming: the approaching side is brighter and bluer.
+        vec3 tangent = normalize(cross(vec3(0.0, 1.0, 0.0), vec3(hit.x, 0.0, hit.z)));
+        float beta = clamp(sqrt(M / rh), 0.0, 0.72);
+        vec3 rayDir = normalize(pos - prevPos);
+        float dop = 1.0 / max(0.28, 1.0 - beta * dot(tangent, -rayDir));
+        float boost = clamp(pow(dop, 3.2), 0.03, 12.0);
+
+        // Gravitational redshift dims the innermost annulus.
+        float redshift = sqrt(max(0.0, 1.0 - RS / rh));
+
+        float rim = pow(smoothstep(0.0, 0.30, tNorm), 1.6);
+        vec3 col = heatColor(pow(temp, 1.15));
+        // Radial falloff: a bright inner region, a dim sprawling outer disk.
+        float falloff = mix(1.0, 0.18, smoothstep(DISK_IN, R_OUT, rh));
+        vec3 emit = col
+                  * (0.12 + 1.9 * temp * temp * temp + 1.5 * rim)
+                  * tex * boost * falloff * (0.45 + 0.55 * redshift);
+
+        // Alpha: denser toward the inner disk, translucent at the outer edge.
+        float edge = smoothstep(R_OUT, R_OUT * 0.55, rh) * smoothstep(DISK_IN, DISK_IN * 1.35, rh);
+        float alpha = clamp(0.92 * edge * (0.55 + 0.45 * tex), 0.0, 1.0);
+
+        acc += emit * trans;
+        trans *= (1.0 - alpha);
+      }
+    }
+  }
+
+  // ---- background --------------------------------------------------------
+  if (trans > 0.006) {
+    vec3 escapeDir = normalize(pos);
+    acc += trans * starField(escapeDir);
+  }
+
+  // ---- tone map ----------------------------------------------------------
+  acc *= 1.1;
+  acc = acc / (1.0 + acc);
+  acc = pow(max(acc, 0.0), vec3(1.0 / 2.2));
+
+  acc += (hash13(vec3(frag, uTime * 0.7)) - 0.5) / 255.0;   // dither
+
+  gl_FragColor = vec4(acc, 1.0);
+}
+</script>
+
+<script>
+(() => {
+  const canvas = document.getElementById("c");
+  const gl = canvas.getContext("webgl", { antialias: false, alpha: false, powerPreference: "high-performance" })
+          || canvas.getContext("experimental-webgl");
+
+  if (!gl) {
+    document.getElementById("fallback").style.display = "grid";
+    return;
+  }
+
+  const compile = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+      throw new Error(gl.getShaderInfoLog(s) || "shader compile failed");
+    }
+    return s;
+  };
+
+  const program = gl.createProgram();
+  gl.attachShader(program, compile(gl.VERTEX_SHADER, document.getElementById("vs").textContent));
+  gl.attachShader(program, compile(gl.FRAGMENT_SHADER, document.getElementById("fs").textContent));
+  gl.linkProgram(program);
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+    throw new Error(gl.getProgramInfoLog(program) || "program link failed");
+  }
+  gl.useProgram(program);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 3, -1, -1, 3]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(program, "aPos");
+  gl.enableVertexAttribArray(aPos);
+  gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+  const u = (name) => gl.getUniformLocation(program, name);
+  const U = {
+    res: u("uRes"), time: u("uTime"), yaw: u("uYaw"), pitch: u("uPitch"),
+    dist: u("uDist"), steps: u("uSteps"),
+  };
+
+  // state
+  const state = { yaw: 0.35, pitch: 0.15, dist: 26, targetYaw: 0.35, targetPitch: 0.15, targetDist: 26 };
+
+  // quality: fewer steps on small screens / high DPR
+  const small = Math.min(window.innerWidth, window.innerHeight) < 700;
+  const STEPS = small ? 240 : 420;
+
+  const resize = () => {
+    // Full-resolution on desktop; mobile GPUs get a slight downscale.
+    const scale = small ? 0.9 : 1.0;
+    canvas.width = Math.max(2, Math.round(window.innerWidth * scale));
+    canvas.height = Math.max(2, Math.round(window.innerHeight * scale));
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  };
+  window.addEventListener("resize", resize, { passive: true });
+  resize();
+
+  // ---- interaction ----
+  let dragging = false, lastX = 0, lastY = 0;
+  canvas.addEventListener("pointerdown", (e) => {
+    dragging = true; lastX = e.clientX; lastY = e.clientY;
+    canvas.classList.add("dragging");
+    canvas.setPointerCapture(e.pointerId);
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    if (!dragging) return;
+    const dx = e.clientX - lastX, dy = e.clientY - lastY;
+    lastX = e.clientX; lastY = e.clientY;
+    state.targetYaw -= dx * 0.005;
+    state.targetPitch = Math.max(-1.35, Math.min(1.35, state.targetPitch + dy * 0.005));
+  });
+  const endDrag = (e) => {
+    dragging = false;
+    canvas.classList.remove("dragging");
+    if (e && canvas.hasPointerCapture?.(e.pointerId)) canvas.releasePointerCapture(e.pointerId);
+  };
+  canvas.addEventListener("pointerup", endPick => endDrag(endPick));
+  canvas.addEventListener("pointercancel", endDrag);
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    state.targetDist = Math.min(60, Math.max(5, state.targetDist * (1 + Math.sign(e.deltaY) * 0.08)));
+  }, { passive: false });
+
+  // ---- loop ----
+  const statsEl = document.getElementById("stats");
+  const t0 = performance.now();
+  let frames = 0, fpsTime = t0, fps = 0;
+
+  const render = () => {
+    const now = performance.now();
+    const t = (now - t0) / 1000;
+
+    // critically-damped-ish easing
+    state.yaw += (state.targetYaw - state.yaw) * 0.09;
+    state.pitch += (state.targetPitch - state.pitch) * 0.09;
+    state.dist += (state.targetDist - state.dist) * 0.12;
+
+    gl.uniform2f(U.res, canvas.width, canvas.height);
+    gl.uniform1f(U.time, t);
+    gl.uniform1f(U.yaw, state.yaw);
+    gl.uniform1f(U.pitch, state.pitch);
+    gl.uniform1f(U.dist, state.dist);
+    gl.uniform1f(U.steps, STEPS);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+    frames++;
+    if (now - fpsTime > 500) {
+      fps = Math.round((frames * 1000) / (now - fpsTime));
+      frames = 0; fpsTime = now;
+      statsEl.textContent = `${canvas.width}×${canvas.height} · ${fps > 0 ? fps + " fps" : "rendering"}`;
+    }
+
+    requestAnimationFrame(render);
+  };
+
+  requestAnimationFrame(render);
+
+  // expose a little state for screenshots / debugging
+  window.__bh = { state, gl, canvas, STEPS };
+})();
+</script>
+</body>
+</html>
